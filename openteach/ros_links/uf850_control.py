@@ -14,6 +14,9 @@ from control_msgs.msg import JointJog
 from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
 from moveit_msgs.srv import ServoCommandType
+from xarm_msgs.srv import GetFloat32List
+from openteach.constants import SCALE_FACTOR
+from scipy.spatial.transform import Rotation as R
 
 
 class DexArmControl():
@@ -38,6 +41,7 @@ class DexArmControl():
         pose_command_in_topic_ = str(param('moveit_servo.pose_command_in_topic',
                                    '/servo_server/pose_command'))
         self._command_frame = str(param('moveit_servo.planning_frame', 'link_base'))
+        self._xarm_ns = str(param('xarm.hw_ns', 'ufactory'))
 
         # QoS compatible with MoveIt Servo
         qos = QoSProfile(depth=ros_queue_size_)
@@ -53,6 +57,7 @@ class DexArmControl():
         self._servo_start_cli = self._node.create_client(Trigger, '/servo_server/start_servo')
         self._servo_stop_cli = self._node.create_client(Trigger, '/servo_server/stop_servo')
         self._switch_cmd_cli = self._node.create_client(ServoCommandType, '/servo_server/switch_command_type')
+        self._get_pos_aa_cli = self._node.create_client(GetFloat32List, f'/{self._xarm_ns}/get_position_aa')
 
 
         # ── Subscriptions ─────────────────────────────────────────────────────
@@ -68,6 +73,7 @@ class DexArmControl():
         self.robot_joint_state = None  # latest sensor_msgs/JointState
         self.robot_commanded_joint_state = None  # synthesized JointState-like from JointJog
         self._current_mode = None
+        self.robot_tcp_position_aa = None
 
         # Start Servo server if available (non-blocking)
         if self._servo_start_cli.wait_for_service(timeout_sec=0.5):
@@ -137,7 +143,7 @@ class DexArmControl():
             timestamp=ts,
         )
         return joint_state
-
+    
     # Commanded joint state is the joint state being sent as an input to the controller
     def get_commanded_robot_state(self):
         raw_joint_state = copy(self.robot_commanded_joint_state)
@@ -158,6 +164,38 @@ class DexArmControl():
             timestamp=ts,
         )
         return joint_state
+    
+    def get_robot_position_aa(self, wait_timeout_sec: float = 0.5):
+        """
+        Call xArm `get_position_aa` service once.
+        Returns a list [x, y, z, rx, ry, rz] on success, or None on failure.
+        Also stores result in self.robot_tcp_position_aa.
+        """
+        if not self._get_pos_aa_cli.wait_for_service(timeout_sec=wait_timeout_sec):
+            self._node.get_logger().warn(f"Service {self._get_pos_aa_cli.srv_name} unavailable")
+            return None
+
+        req = GetFloat32List.Request()
+        future = self._get_pos_aa_cli.call_async(req)
+        rclpy.spin_until_future_complete(self._node, future, timeout_sec=wait_timeout_sec)
+
+        if not future.done():
+            self._node.get_logger().warn("get_position_aa call timed out")
+
+        try:
+            resp = future.result()
+        except Exception as e:
+            self._node.get_logger().error(f"get_position_aa failed: {e}")
+            return None
+        
+        if resp is None or resp.ret != 0 or len(resp.datas) < 6:
+            msg = getattr(resp, "message", "")
+            self._node.get_logger().warn(f"get_position_aa err (ret={getattr(resp, 'ret', 'NA')}): (msg)")
+            return None
+        
+        vals = list(resp.datas[:6])
+        self.robot_tcp_position_aa = vals
+        return vals
 
     # Get the robot joint/cartesian position
     def get_robot_position(self):
@@ -187,6 +225,23 @@ class DexArmControl():
         if cmd is None:
             return None
         return cmd['position']
+    
+    def get_arm_joint_state(self):
+        joint_positions = self.get_robot_state()
+        joint_state = dict(
+            position = np.array(joint_positions['position'], dtype=np.float32),
+            timestamp = time.time()
+        )
+        return joint_state
+    
+    def get_arm_pose(self):
+        home_pose = self.get_robot_position_aa()
+        home_affine = self.robot_pose_aa_to_affine(home_pose)
+        return home_affine
+    
+    def get_arm_cartesian_coords(self):
+        status, home_pose = self.get_robot_position_aa()
+        return home_pose
 
     # Movement functions
     def move_robot(self, joint_angles):
@@ -217,11 +272,6 @@ class DexArmControl():
             self._servo_stop_cli.call_async(Trigger.Request())
         if self._servo_start_cli.wait_for_service(timeout_sec=0.5):
             self._servo_start_cli.call_async(Trigger.Request())
-
-    # Full robot commands
-    def move_robot(self, joint_angles, arm_angles):
-        # Keep signature for compatibility; use joint jog only.
-        self.move_robot(joint_angles)
 
     def arm_control(self, arm_pose):
         """
@@ -283,3 +333,18 @@ class DexArmControl():
         # Duplicate in template; keep and warn.
         self._node.get_logger().warn('home_robot(): duplicate template method; not implemented')
         # For now we're using cartesian values
+    
+    def robot_pose_aa_to_affine(self,pose_aa: np.ndarray) -> np.ndarray:
+        """Converts a robot pose in axis-angle format to an affine matrix.
+        Args:
+            pose_aa (list): [x, y, z, ax, ay, az] where (x, y, z) is the position and (ax, ay, az) is the axis-angle rotation.
+            x, y, z are in mm and ax, ay, az are in radians.
+        Returns:
+            np.ndarray: 4x4 affine matrix [[R, t],[0, 1]]
+        """
+
+        rotation = R.from_rotvec(pose_aa[3:]).as_matrix()
+        translation = np.array(pose_aa[:3]) / SCALE_FACTOR
+
+        return np.block([[rotation, translation[:, np.newaxis]],
+                        [0, 0, 0, 1]])
