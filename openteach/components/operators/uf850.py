@@ -6,7 +6,6 @@ from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 
 from copy import deepcopy as copy
-from asyncio import threads
 from openteach.constants import *
 from openteach.utils.timer import FrequencyTimer
 from openteach.utils.network import ZMQKeypointSubscriber, ZMQKeypointPublisher
@@ -91,10 +90,16 @@ class UF850ArmOperator(Operator):
         )
         # Define Robot object
         self._robot = UF850()
-        self.robot.reset()
-        
+        self._robot.reset()
+
         # Get the initial pose of the robot
-        home_pose=np.array(self.robot.get_cartesian_position())
+        home_pose = self.robot.get_cartesian_position()
+        if home_pose is None:
+            raise RuntimeError(
+                "Failed to retrieve UF850 initial pose from ROS. Ensure joint "
+                "states and the xArm get_position_aa service are available."
+            )
+        home_pose = np.array(home_pose, dtype=np.float32)
         self.robot_init_H = self.robot_pose_aa_to_affine(home_pose)
         self._timer = FrequencyTimer(BIMANUAL_VR_FREQ) 
 

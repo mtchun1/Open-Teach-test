@@ -190,9 +190,11 @@ class DexArmControl():
         
         if resp is None or resp.ret != 0 or len(resp.datas) < 6:
             msg = getattr(resp, "message", "")
-            self._node.get_logger().warn(f"get_position_aa err (ret={getattr(resp, 'ret', 'NA')}): (msg)")
+            self._node.get_logger().warn(
+                f"get_position_aa err (ret={getattr(resp, 'ret', 'NA')}): {msg}"
+            )
             return None
-        
+
         vals = list(resp.datas[:6])
         self.robot_tcp_position_aa = vals
         return vals
@@ -227,21 +229,28 @@ class DexArmControl():
         return cmd['position']
     
     def get_arm_joint_state(self):
-        joint_positions = self.get_robot_state()
-        joint_state = dict(
-            position = np.array(joint_positions['position'], dtype=np.float32),
-            timestamp = time.time()
+        joint_state = self.get_robot_state()
+        if joint_state is None or joint_state["position"].size == 0:
+            return None
+
+        return dict(
+            position=np.array(joint_state["position"], dtype=np.float32),
+            velocity=np.array(joint_state["velocity"], dtype=np.float32),
+            effort=np.array(joint_state["effort"], dtype=np.float32),
+            timestamp=joint_state["timestamp"],
         )
-        return joint_state
-    
+
     def get_arm_pose(self):
-        home_pose = self.get_robot_position_aa()
-        home_affine = self.robot_pose_aa_to_affine(home_pose)
-        return home_affine
-    
+        pose_aa = self.get_robot_position_aa()
+        if pose_aa is None:
+            return None
+        return self.robot_pose_aa_to_affine(pose_aa)
+
     def get_arm_cartesian_coords(self):
-        status, home_pose = self.get_robot_position_aa()
-        return home_pose
+        pose_aa = self.get_robot_position_aa()
+        if pose_aa is None:
+            return None
+        return pose_aa
 
     # Movement functions
     def move_robot(self, joint_angles):
