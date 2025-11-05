@@ -35,12 +35,14 @@ operators:
     _target_: openteach.components.operators.uf850.UF850ArmOperator
     host: ${host_address}
     transformed_keypoints_port: ${transformed_position_keypoint_port}
-    arm_resolution_port: ${resolution_button_publish_port}
-    gripper_port: ${gripper_publish_port_right}
-    cartesian_publisher_port: ${cartesian_publisher_port}
-    joint_publisher_port: ${joint_publisher_port}
-    cartesian_command_publisher_port: ${cartesian_command_publisher_port}
+    moving_average_limit: 1
     use_filter: true
+    arm_resolution_port: ${resolution_button_publish_port}
+    teleoperation_reset_port: ${teleop_reset_publish_port}
+    # gripper_port: ${gripper_publish_port_right}
+    # cartesian_publisher_port: ${cartesian_publisher_port}
+    # joint_publisher_port: ${joint_publisher_port}
+    # cartesian_command_publisher_port: ${cartesian_command_publisher_port}
 
 # List of controller classes used
 controllers:
