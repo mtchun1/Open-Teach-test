@@ -1,22 +1,41 @@
 import numpy as np
 import time
-from types import SimpleNamespace
-
 from copy import deepcopy as copy
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from threading import Thread
 
 from sensor_msgs.msg import JointState
+from xarm_msgs.msg import RobotMsg
 from geometry_msgs.msg import TwistStamped
 from control_msgs.msg import JointJog
-from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
-from moveit_msgs.srv import ServoCommandType
+# from moveit_commander import MoveGroupCommander
 from xarm_msgs.srv import GetFloat32List
 from openteach.constants import SCALE_FACTOR
 from scipy.spatial.transform import Rotation as R
+
+HAND_JOINT_STATE_TOPIC = '/allegroHand/joint_states'
+HAND_COMMANDED_JOINT_STATE_TOPIC = '/allegroHand/commanded_joint_states'
+
+UF850_JOINT_STATE_TOPIC = 'joint_states'
+UF850_ROBOT_STATE_TOPIC = 'robot_states'
+
+HW_NS = 'ufactory'
+
+TWIST_RATE_HZ = 200.0
+FRAME_ID = 'link_base'
+
+JJ_RATE_HZ = 200.0
+JJ_MAX_DELTA_PER_STEP = 0.015
+JJ_TOLERANCE = 0.003
+JJ_TIMEOUT_SEC = 5.0
+JJ_FRAME_ID = 'link_base'
+
 
 
 class DexArmControl():
@@ -25,23 +44,51 @@ class DexArmControl():
         if not rclpy.ok():
             rclpy.init(args=None)
         self._node = Node('dex_arm', automatically_declare_parameters_from_overrides=True)
-        self._node.get_logger().info('dex_arm (ROS 2 Jazzy) init start')
+        self._node.get_logger().info('dex_arm (ROS 2 Humble) init start')
+        self._executor = MultiThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._cbg = ReentrantCallbackGroup()
 
-        # ── Parameters (align with MoveIt Servo conventions) ───────────────────
+        # Set Parameters
         def param(name, default):
             if not self._node.has_parameter(name):
                 self._node.declare_parameter(name, default)
                 return default
             return self._node.get_parameter(name).value
-
-        ros_queue_size_ = int(param('ros_queue_size', 10))
-        self._joint_states_topic = str(param('joint_states_topic', '/joint_states'))
+        
+        ros_queue_size_ = int(param('ros_queue_size', 1)) # For Qos
+        self._xarm_ns = str(param('xarm.hw_ns', HW_NS))
+        self._joint_states_topic = str(param('joint_states_topic', f'/{self._xarm_ns}/{UF850_JOINT_STATE_TOPIC}'))
+        self._robot_states_topic = str(param('robot_states_topic', f'/{self._xarm_ns}/{UF850_ROBOT_STATE_TOPIC}'))
         cartesian_command_in_topic_ = str(param('moveit_servo.cartesian_command_in_topic', '/servo_server/delta_twist_cmds'))
         joint_command_in_topic_ = str(param('moveit_servo.joint_command_in_topic', '/servo_server/delta_joint_cmds'))
-        pose_command_in_topic_ = str(param('moveit_servo.pose_command_in_topic',
-                                   '/servo_server/pose_command'))
-        self._command_frame = str(param('moveit_servo.planning_frame', 'link_base'))
-        self._xarm_ns = str(param('xarm.hw_ns', 'ufactory'))
+        self._command_frame = str(param('moveit_servo.planning_frame', FRAME_ID))
+
+        self._node.get_logger().info(f'DexArmControl params: _xarm_ns={self._xarm_ns}, _joint_states_topic={self._joint_states_topic}, _robot_states_topic={self._robot_states_topic}, cartesian_command_in_topic_={cartesian_command_in_topic_}, joint_command_in_topic_={joint_command_in_topic_}, _command_frame={self._command_frame}')
+
+        # Internal state storage
+        self.uf850_joint_state = None  # latest sensor_msgs/JointState
+        self.uf850_robot_state = None  # latest xarm_msgs/msg/RoboMsg.msg
+        self._current_mode = None
+        self._pose_future = None          # track in-flight request
+        self.uf850_tcp_position_aa = None # latest cached pose dict
+        self._twist_active = False
+        self._twist_deadline = None
+        self._twist_cmd = np.zeros(6, dtype=float)
+        self._jog_active = False
+        self._jog_session = None  # dict set by move_arm_joint
+
+        # persistent timers (never canceled)
+        self._twist_timer = self._node.create_timer(
+            1.0/float(TWIST_RATE_HZ),
+            self._publish_twist_tick,
+            callback_group=self._cbg
+        )
+        self._jog_timer = self._node.create_timer(
+            1.0/float(JJ_RATE_HZ),
+            self._publish_jog_tick,
+            callback_group=self._cbg
+        )
 
         # QoS compatible with MoveIt Servo
         qos = QoSProfile(depth=ros_queue_size_)
@@ -51,299 +98,267 @@ class DexArmControl():
         # ── Publishers ────────────────────────────────────────────────────────
         self._twist_pub = self._node.create_publisher(TwistStamped, cartesian_command_in_topic_, qos)
         self._joint_pub = self._node.create_publisher(JointJog, joint_command_in_topic_, qos)
-        self._pose_pub = self._node.create_publisher(PoseStamped, pose_command_in_topic_, qos)
 
         # ── Services ─────────────────────────────────────────────────────────
         self._servo_start_cli = self._node.create_client(Trigger, '/servo_server/start_servo')
         self._servo_stop_cli = self._node.create_client(Trigger, '/servo_server/stop_servo')
-        self._switch_cmd_cli = self._node.create_client(ServoCommandType, '/servo_server/switch_command_type')
         self._get_pos_aa_cli = self._node.create_client(GetFloat32List, f'/{self._xarm_ns}/get_position_aa')
 
-
         # ── Subscriptions ─────────────────────────────────────────────────────
-        self._robot_joint_state_sub = self._node.create_subscription(
-            JointState, self._joint_states_topic, self._callback_robot_joint_state, qos
+        self._uf850_joint_state_sub = self._node.create_subscription(
+            JointState, self._joint_states_topic, self._callback_uf850_joint_state, qos
         )
-        # Subscribe to what we publish for commanded-joint echo (JointJog)
-        self._robot_cmd_joint_sub = self._node.create_subscription(
-            JointJog, joint_command_in_topic_, self._callback_robot_commanded_joint_state_from_jointjog, qos
+        self._uf850_robot_state_sub = self._node.create_subscription(
+            RobotMsg, self._robot_states_topic, self._callback_uf850_robot_state, qos
         )
 
-        # Internal state storage
-        self.robot_joint_state = None  # latest sensor_msgs/JointState
-        self.robot_commanded_joint_state = None  # synthesized JointState-like from JointJog
-        self._current_mode = None
-        self.robot_tcp_position_aa = None
+        self._spin_thread = Thread(target=self._executor.spin, daemon=True)
+        self._spin_thread.start()
 
         # Start Servo server if available (non-blocking)
         if self._servo_start_cli.wait_for_service(timeout_sec=0.5):
             self._servo_start_cli.call_async(Trigger.Request())
-        # Set Servo Command Type
-        self._ensure_mode(ServoCommandType.Request.JOINT_JOG)
 
-    def _ensure_mode(self, mode_const):
-        if self._current_mode == mode_const:
-            return
-        if self._switch_cmd_cli.wait_for_service(timeout_sec=0.2):
-            req = ServoCommandType.Request()
-            req.command_type = mode_const
-            self._switch_cmd_cli.call_async(req)
-            self._current_mode = mode_const
+        # ── Blocking check for first robot state ───────────────────────────────
+        start_time = time.time()
+        timeout = 5.0  # seconds
+        self._node.get_logger().info("Waiting for /robot_states message...")
 
-    # Controller initializers
-    def _init_robot_control(self):
-        # Already initialized in __init__; present to satisfy the template.
-        pass
+        while (self.uf850_robot_state) is None and (time.time() - start_time) < timeout:
+            continue
+        if self.uf850_robot_state is None:
+            self._node.get_logger().warn("No /robot_states received...")
+        else:
+            self._node.get_logger().info("Received first /robot_states message.")
+
+        # ── Blocking check for first joint state ───────────────────────────────
+        start_time = time.time()
+        timeout = 5.0  # seconds
+        self._node.get_logger().info("Waiting for /joint_states message...")
+
+        while (self.uf850_joint_state) is None and (time.time() - start_time) < timeout:
+            continue
+        if self.uf850_joint_state is None:
+            self._node.get_logger().warn("No /joint_states received...")
+        else:
+            self._node.get_logger().info("Received first /joint_states message.")
 
     # Rostopic callback functions
-    def _callback_robot_joint_state(self, joint_state: JointState):
-        self.robot_joint_state = joint_state
-
-    # Commanded joint state is basically the joint state being sent as an input to the controller
-    def _callback_robot_commanded_joint_state(self, joint_state):
-        # Template method kept for compatibility; we set from JointJog callback below.
-        self.robot_commanded_joint_state = joint_state
-
-    # Convert JointJog messages into a JointState-like object for get_commanded_robot_state()
-    def _callback_robot_commanded_joint_state_from_jointjog(self, msg: JointJog):
-        now = self._node.get_clock().now().to_msg()
-        # Treat displacements as the primary field for incremental jog; velocities if provided
-        position = list(msg.displacements) if msg.displacements else []
-        velocity = list(msg.velocities) if msg.velocities else []
-        # Build a minimal JointState-like object using SimpleNamespace
-        js_like = SimpleNamespace(
-            name=list(msg.joint_names),
-            position=position,
-            velocity=velocity,
-            effort=[],
-            header=SimpleNamespace(stamp=SimpleNamespace(sec=now.sec, nanosec=now.nanosec))
-        )
-        self._callback_robot_commanded_joint_state(js_like)
-
-    # State information function
-    def get_robot_state(self):
-        # Get the robot joint state
-        raw_joint_state = self.robot_joint_state
-        if raw_joint_state is None:
-            return None
-        # Handle possible empty fields gracefully
-        pos = np.array(raw_joint_state.position, dtype=np.float32) if raw_joint_state.position else np.array([], dtype=np.float32)
-        vel = np.array(raw_joint_state.velocity, dtype=np.float32) if raw_joint_state.velocity else np.array([], dtype=np.float32)
-        eff = np.array(raw_joint_state.effort, dtype=np.float32) if raw_joint_state.effort else np.array([], dtype=np.float32)
-        # ROS 2 builtin_interfaces/Time fields are sec/nanosec
-        stamp = getattr(raw_joint_state, 'header', None)
-        if stamp and hasattr(raw_joint_state.header, 'stamp'):
-            ts = raw_joint_state.header.stamp.sec + raw_joint_state.header.stamp.nanosec * 1e-9
-        else:
-            ts = time.time()
-        joint_state = dict(
-            position=pos,
-            velocity=vel,
-            effort=eff,
-            timestamp=ts,
-        )
-        return joint_state
+    def _callback_uf850_joint_state(self, joint_state: JointState):
+        self.uf850_joint_state = joint_state
     
-    # Commanded joint state is the joint state being sent as an input to the controller
-    def get_commanded_robot_state(self):
-        raw_joint_state = copy(self.robot_commanded_joint_state)
-        if raw_joint_state is None:
-            return None
-        pos = np.array(getattr(raw_joint_state, 'position', []), dtype=np.float32)
-        vel = np.array(getattr(raw_joint_state, 'velocity', []), dtype=np.float32)
-        eff = np.array(getattr(raw_joint_state, 'effort', []), dtype=np.float32)
-        # synthesized timestamp
-        if hasattr(raw_joint_state, 'header') and hasattr(raw_joint_state.header, 'stamp'):
-            ts = raw_joint_state.header.stamp.sec + raw_joint_state.header.stamp.nanosec * 1e-9
-        else:
-            ts = time.time()
-        joint_state = dict(
-            position=pos,
-            velocity=vel,
-            effort=eff,
-            timestamp=ts,
-        )
-        return joint_state
-    
-    def get_robot_position_aa(self, wait_timeout_sec: float = 0.5):
-        """
-        Call xArm `get_position_aa` service once.
-        Returns a list [x, y, z, rx, ry, rz] on success, or None on failure.
-        Also stores result in self.robot_tcp_position_aa.
-        """
-        if not self._get_pos_aa_cli.wait_for_service(timeout_sec=wait_timeout_sec):
-            self._node.get_logger().warn(f"Service {self._get_pos_aa_cli.srv_name} unavailable")
-            return None
+    def _callback_uf850_robot_state(self, robot_state: RobotMsg):
+        self.uf850_robot_state = robot_state
 
-        req = GetFloat32List.Request()
-        future = self._get_pos_aa_cli.call_async(req)
-        rclpy.spin_until_future_complete(self._node, future, timeout_sec=wait_timeout_sec)
-
-        if not future.done():
-            self._node.get_logger().warn("get_position_aa call timed out")
-
-        try:
-            resp = future.result()
-        except Exception as e:
-            self._node.get_logger().error(f"get_position_aa failed: {e}")
+    # ── Get Arm Cartesian State (RPY) ────────────────────────────────────────────────────────
+    #   return raw state [x, y, z, roll, pitch, yaw]
+    def get_arm_cartesian_coords(self):
+        if self.uf850_robot_state is None:
             return None
         
-        if resp is None or resp.ret != 0 or len(resp.datas) < 6:
-            msg = getattr(resp, "message", "")
-            self._node.get_logger().warn(
-                f"get_position_aa err (ret={getattr(resp, 'ret', 'NA')}): {msg}"
-            )
-            return None
-
-        vals = list(resp.datas[:6])
-        self.robot_tcp_position_aa = vals
-        return vals
-
-    # Get the robot joint/cartesian position
-    def get_robot_position(self):
-        # Return latest joint positions (radians) from /joint_states
-        state = self.get_robot_state()
-        if state is None:
-            return None
-        return state['position']
-
-    # Get the robot joint velocity
-    def get_robot_velocity(self):
-        state = self.get_robot_state()
-        if state is None:
-            return None
-        return state['velocity']
-
-    # Get the robot joint torque
-    def get_robot_torque(self):
-        state = self.get_robot_state()
-        if state is None:
-            return None
-        return state['effort']
-
-    # Get the commanded robot joint position
-    def get_commanded_robot_joint_position(self):
-        cmd = self.get_commanded_robot_state()
-        if cmd is None:
-            return None
-        return cmd['position']
+        raw_cartesian_state = copy(self.uf850_robot_state)
+        return raw_cartesian_state.pose
     
-    def get_arm_joint_state(self):
-        joint_state = self.get_robot_state()
-        if joint_state is None or joint_state["position"].size == 0:
+    #   return formatted state with timestamp
+    #   dict['position': np.array(x, y, z), 'orientation': np.array(roll, pitch, yaw)]
+    def get_arm_cartesian_state(self):
+        if self.uf850_robot_state is None:
             return None
+        
+        raw_cartesian_state = copy(self.uf850_robot_state)
 
-        return dict(
-            position=np.array(joint_state["position"], dtype=np.float32),
-            velocity=np.array(joint_state["velocity"], dtype=np.float32),
-            effort=np.array(joint_state["effort"], dtype=np.float32),
-            timestamp=joint_state["timestamp"],
+        cartesian_state = dict( 
+            position = np.array([
+                raw_cartesian_state.pose[0], raw_cartesian_state.pose[1], raw_cartesian_state.pose[2]
+            ], dtype = np.float32),
+            orientation = np.array([
+                raw_cartesian_state.pose[3], raw_cartesian_state.pose[4], raw_cartesian_state.pose[5]
+            ], dtype=np.float32),
+            timestamp = raw_cartesian_state.header.stamp.secs + (raw_cartesian_state.header.stamp.nsecs * 1e-9)
         )
-
-    def get_arm_pose(self):
-        pose_aa = self.get_robot_position_aa()
-        if pose_aa is None:
+        return cartesian_state
+    
+    # ── Get Arm Cartesian State (Axis Angle) ────────────────────────────────────────────────────────
+    def get_arm_cartesian_coords_aa(self):
+        if self.uf850_robot_state is None:
             return None
-        return self.robot_pose_aa_to_affine(pose_aa)
+        
+        raw_cartesian_state = copy(self.uf850_robot_state)
+        x, y, z = raw_cartesian_state.pose[0], raw_cartesian_state.pose[1], raw_cartesian_state.pose[2]
+        roll, pitch, yaw = raw_cartesian_state.pose[3], raw_cartesian_state.pose[4], raw_cartesian_state.pose[5]
+        oritentation_aa = self.uf850_pose_rpy_to_aa(roll, pitch, yaw)
+        return np.array([x, y, z, oritentation_aa[0], oritentation_aa[1], oritentation_aa[2]], dtype=np.float32)
+        self._node.get_logger().info(
+            f"coords_aa: {roll}, {pitch}, {yaw}"
+        )
+        # return np.array([x, y, z, roll, pitch, yaw], dtype=np.float32)
 
-    def get_arm_cartesian_coords(self):
-        pose_aa = self.get_robot_position_aa()
-        if pose_aa is None:
+    def get_arm_cartesian_state_aa(self):
+        if self.uf850_robot_state is None:
             return None
-        return pose_aa
+        
+        raw_cartesian_state = copy(self.uf850_robot_state)
+        x, y, z = raw_cartesian_state.pose[0], raw_cartesian_state.pose[1], raw_cartesian_state.pose[2]
+        roll, pitch, yaw = raw_cartesian_state.pose[3], raw_cartesian_state.pose[4], raw_cartesian_state.pose[5]
+        oritentation_aa = self.uf850_pose_rpy_to_aa(roll, pitch, yaw)
+        
+        cartesian_state_aa = dict( 
+            position = np.array([
+                x, y, z
+            ], dtype = np.float32),
+            orientation = np.array([
+                oritentation_aa[0], oritentation_aa[1], oritentation_aa[2]
+            ], dtype=np.float32),
+            timestamp = raw_cartesian_state.header.stamp.secs + (raw_cartesian_state.header.stamp.nsecs * 1e-9)
+        )
+        return cartesian_state_aa
 
-    # Movement functions
-    def move_robot(self, joint_angles):
-        """
-        Publish incremental joint jog using JointJog.displacements.
-        `joint_angles` is interpreted as Δθ per message (radians).
-        """
-        self._ensure_mode(ServoCommandType.Request.JOINT_JOG)
-        msg = JointJog()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
+
+    
+    # ── Request arm joint state (Servo Angles) ──────────────────────────────────────────────────────── 
+    def get_arm_position(self):
+        if self.uf850_joint_state is None:
+            return None
+        return np.array(self.uf850_joint_state.position, dtype = np.float32)
+    
+    def get_arm_velocity(self):
+        if self.uf850_joint_state is None:
+            return None
+        return np.array(self.uf850_joint_state.velocity, dtype = np.float32)
+    
+    def get_arm_torque(self):
+        if self.uf850_joint_state is None:
+            return None
+        return np.array(self.uf850_joint_state.effort, dtype = np.float32)
+    
+    #  Formatted with time stamp
+    def get_arm_joint_state(self):
+        if self.uf850_joint_state is None:
+            return None
+        
+        raw_joint_state = copy(self.uf850_joint_state)
+
+        joint_state = dict(
+            position = np.array(raw_joint_state.position[:6], dtype = np.float32),
+            velocity = np.array(raw_joint_state.velocity[:6], dtype = np.float32),
+            effort = np.array(raw_joint_state.effort[:6], dtype = np.float32),
+            timestamp = raw_joint_state.header.stamp.secs + (raw_joint_state.header.stamp.nsecs * 1e-9)
+        )
+        return joint_state
+    
+    # def move_arm(self, uf850_angles):
+        
+    
+    # ── Command Timer Ticks ────────────────────────────────────────────────────────
+ 
+    def _publish_twist_tick(self):
+        if not self._twist_active:
+            return
+        now = self._node.get_clock().now()
+        if self._twist_deadline is not None and now >= self._twist_deadline:
+            self._twist_active = False
+            return
+
+        x, y, z, p, q, r = self._twist_cmd
+        msg = TwistStamped()
+        msg.header.stamp = now.to_msg()
         msg.header.frame_id = self._command_frame
-        # If we have a live joint state, use its joint order for names; else leave empty
-        if self.robot_joint_state and getattr(self.robot_joint_state, 'name', None):
-            msg.joint_names = list(self.robot_joint_state.name)
-        # Displacements mode (incremental)
-        msg.displacements = [float(x) for x in np.ravel(joint_angles).tolist()]
+        # msg.twist.linear.x = x
+        # msg.twist.linear.y = y
+        # msg.twist.linear.z = z
+        msg.twist.linear.x = 0.0
+        msg.twist.linear.y = 0.0
+        msg.twist.linear.z = 0.0
+        msg.twist.angular.x = p
+        msg.twist.angular.y = q
+        msg.twist.angular.z = r
+        self._twist_pub.publish(msg)
+        # self._node.get_logger().info(
+        #     f"Published Twist Command Translation: {x}, {y}, {z}, {np.rad2deg(p)}, {np.rad2deg(q)}, {np.rad2deg(r)} in {msg.header.frame_id}"
+        # )
+        # self._node.get_logger().info(
+        #     f"Published Twist Command Orientation: {np.rad2deg(p)}, {np.rad2deg(q)}, {np.rad2deg(r)} in {msg.header.frame_id}"
+        # )
+
+    def _publish_jog_tick(self):
+        if not self._jog_active or self._jog_session is None:
+            return
+
+        s = self._jog_session
+        now = self._node.get_clock().now()
+
+        if now >= s["deadline"]:
+            self._node.get_logger().warn("move_arm_joint(): timeout; stopping jog stream.")
+            self._jog_active = False
+            return
+
+        js = self.uf850_joint_state
+        if js is None or len(js.position) != s["goal"].size:
+            self._node.get_logger().warn("move_arm_joint(): missing/invalid /joint_states during stream.")
+            self._jog_active = False
+            return
+
+        curr = np.array(js.position, dtype=np.float32)
+        delta = s["goal"] - curr
+        if np.all(np.abs(delta) <= s["tol"]):
+            self._node.get_logger().info("move_arm_joint(): goal reached; stopping jog stream.")
+            self._jog_active = False
+            return
+
+        step = np.clip(delta, -s["max_step"], s["max_step"])
+
+        msg = JointJog()
+        msg.header.stamp = now.to_msg()
+        msg.header.frame_id = s["frame_id"]
+        msg.joint_names = s["names"]
+        msg.displacements = step.tolist()
+        msg.velocities = [0.0] * len(step)
         self._joint_pub.publish(msg)
 
-    # Home Robot
-    def home_robot(self):
-        # No absolute homing via Servo; this is a placeholder.
-        self._node.get_logger().warn('home_robot(): not implemented for Servo-only control')
 
-    # Reset the Robot
-    def reset_robot(self):
-        # Try stopping and starting Servo to clear state.
-        if self._servo_stop_cli.wait_for_service(timeout_sec=0.5):
-            self._servo_stop_cli.call_async(Trigger.Request())
-        if self._servo_start_cli.wait_for_service(timeout_sec=0.5):
-            self._servo_start_cli.call_async(Trigger.Request())
+    # ── Move Arm Joint Angles (Joint Jog) ──────────────────────────────────────────────────────── 
+    def move_arm_joint(self, joint_angles):
+        if self.uf850_joint_state is None:
+            self._node.get_logger().warn("move_arm_joint(): no ufactory/joint_states yet; cannot jog.")
+            return False
 
-    def arm_control(self, arm_pose):
-        """
-        Publish a geometry_msgs/PoseStamped to Servo's pose_command_in_topic.
-        Accepts either:
-        - dict/object with x,y,z and roll,pitch,yaw (radians), or
-        - dict/object with x,y,z and qx,qy,qz,qw (unit quaternion).
-        """
-        self._ensure_mode(ServoCommandType.Request.POSE)
-        def get(src, name, default=0.0):
-            if isinstance(src, dict):
-                return src.get(name, default)
-            return getattr(src, name, default)
+        current_names = list(self.uf850_joint_state.name or [])
+        if not current_names:
+            self._node.get_logger().warn("move_arm_joint(): ufactory/joint_states has no names.")
+            return False
 
-        # Position
-        x = float(get(arm_pose, "x", 0.0))
-        y = float(get(arm_pose, "y", 0.0))
-        z = float(get(arm_pose, "z", 0.0))
+        goal = np.array(joint_angles, dtype=float).reshape(-1)
 
-        # Orientation: prefer quaternion if present, else RPY→quat
-        has_quat = all(k in (arm_pose.keys() if isinstance(arm_pose, dict) else arm_pose.__dict__)
-                    for k in ("qx", "qy", "qz", "qw"))
-        if has_quat:
-            qx = float(get(arm_pose, "qx"))
-            qy = float(get(arm_pose, "qy"))
-            qz = float(get(arm_pose, "qz"))
-            qw = float(get(arm_pose, "qw"))
-        else:
-            import math
-            roll  = float(get(arm_pose, "roll",  get(arm_pose, "rx", 0.0)))
-            pitch = float(get(arm_pose, "pitch", get(arm_pose, "ry", 0.0)))
-            yaw   = float(get(arm_pose, "yaw",   get(arm_pose, "rz", 0.0)))
-            # RPY -> quaternion
-            cy, sy = math.cos(yaw * 0.5),   math.sin(yaw * 0.5)
-            cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
-            cr, sr = math.cos(roll * 0.5),  math.sin(roll * 0.5)
-            qw = cr*cp*cy + sr*sp*sy
-            qx = sr*cp*cy - cr*sp*sy
-            qy = cr*sp*cy + sr*cp*sy
-            qz = cr*cp*sy - sr*sp*cy
+        self._jog_session = {
+            "names": current_names,
+            "goal": goal,
+            "rate_hz": float(JJ_RATE_HZ),
+            "max_step": float(JJ_MAX_DELTA_PER_STEP),
+            "tol": float(JJ_TOLERANCE),
+            "deadline": self._node.get_clock().now() + rclpy.time.Duration(seconds=float(JJ_TIMEOUT_SEC)),
+            "frame_id": JJ_FRAME_ID
+        }
+        self._jog_active = True   # <-- was _job_active typo; fix to _jog_active
+        return True
 
-        msg = PoseStamped()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        # Must be set: Servo expects header.frame_id for Twist/Pose commands.
-        # Use your planning/command frame (often "link_base" or whatever you set via params).
-        msg.header.frame_id = self._command_frame
-        msg.pose.position.x = x
-        msg.pose.position.y = y
-        msg.pose.position.z = z
-        msg.pose.orientation.x = qx
-        msg.pose.orientation.y = qy
-        msg.pose.orientation.z = qz
-        msg.pose.orientation.w = qw
-
-        self._pose_pub.publish(msg)
-
-    #Home the Robot
-    def home_robot(self):
-        # Duplicate in template; keep and warn.
-        self._node.get_logger().warn('home_robot(): duplicate template method; not implemented')
-        # For now we're using cartesian values
     
-    def robot_pose_aa_to_affine(self,pose_aa: np.ndarray) -> np.ndarray:
+    def move_arm_cartesian_velocity(self, cartesian_velocity_values, duration):
+        if self._twist_pub is None:
+            self._node.get_logger().error("Twist publisher not initialized.")
+            return False
+
+        self._twist_cmd = cartesian_velocity_values.astype(float).reshape(6)
+        self._twist_deadline = self._node.get_clock().now() + rclpy.time.Duration(seconds=float(duration))
+        self._twist_active = True
+        return True
+
+    # ── Helper Functions ────────────────────────────────────────────────────────
+    def uf850_pose_rpy_to_aa(self, roll, pitch, yaw):
+        rot = R.from_euler('XYZ', [roll, pitch, yaw], degrees=False)
+        rotvec = rot.as_rotvec() # axis-angle as a vector; norm = angle(rad)
+        return rotvec
+
+    def uf850_pose_aa_to_affine(self,pose_aa: np.ndarray) -> np.ndarray:
         """Converts a robot pose in axis-angle format to an affine matrix.
         Args:
             pose_aa (list): [x, y, z, ax, ay, az] where (x, y, z) is the position and (ax, ay, az) is the axis-angle rotation.
@@ -357,3 +372,18 @@ class DexArmControl():
 
         return np.block([[rotation, translation[:, np.newaxis]],
                         [0, 0, 0, 1]])
+    
+    # TODO: 
+    def home_arm(self):
+        # Possibly can enable cartesian position control with xarm_planner running at the same time as moveit servo
+        # Could conflict with controllers though
+        pass
+
+    def reset_arm(self):
+        self.home_arm()
+
+    # ── Hand/Gripper Functions ────────────────────────────────────────────────────────
+    def get_gripper_state(self):
+        pass
+        
+
